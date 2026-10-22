@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: smart_inventory
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: inventory_local
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d smart_inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  inventory_data:

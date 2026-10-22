@@ -1,0 +1,9 @@
+{
+  "name": "smart-inventory",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix inventory-api install && npm --prefix inventory-frontend install",
+    "build": "npm --prefix inventory-api run build && npm --prefix inventory-frontend run build",
+    "test": "npm --prefix inventory-api test"
+  }
+}

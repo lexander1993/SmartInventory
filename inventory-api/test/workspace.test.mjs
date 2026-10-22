@@ -1,0 +1,58 @@
+import {PGlite} from '@electric-sql/pglite';
+import mocks from 'node-mocks-http';
+import {EventEmitter} from 'node:events';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+// Both engines are fresh in-memory PostgreSQL databases. No application database is used.
+let engine=new PGlite();
+async function schema(){for(const file of ['001_init.sql','002_workspace.sql','003_ask_ai.sql'])await engine.exec(await readFile(new URL('../db/'+file,import.meta.url),'utf8'));}
+await schema();
+process.env.DATABASE_URL='postgresql://unused:unused@localhost/unused';
+const {db,actorContext}=await import('../src/db.ts');
+const raw=async(sql,args)=>{const r=await engine.query(sql,args);return {...r,rowCount:r.rows.length || r.affectedRows || 0};};
+const query=async(sql,args)=>{const r=await raw(sql,args);if(/^BEGIN\b/i.test(sql))await raw("SELECT set_config('app.actor',$1,true)",[actorContext.getStore() || 'system']);return r;};
+db.query=async(sql,args)=>{await query('BEGIN');try{const r=await query(sql,args);await query('COMMIT');return r;}catch(e){await query('ROLLBACK');throw e;}};
+db.connect=async()=>({query,release(){}});
+const {app}=await import('../src/app.ts');
+async function request(method,url,body,headers={}){const req=mocks.createRequest({method,url,body,headers:{'content-type':'application/json',...headers}});const res=mocks.createResponse({eventEmitter:EventEmitter});const done=new Promise((resolve,reject)=>{res.on('end',()=>resolve({status:res.statusCode,data:res._getJSONData(),cookies:res.cookies}));setTimeout(()=>reject(new Error('Request timeout '+url)),10000).unref();});app.handle(req,res);return done;}
+assert.equal((await request('GET','/api/products')).status,200);
+assert.equal((await request('POST','/api/auth/login',{})).status,404);
+assert.equal((await request('GET','/api/auth/users')).status,404);
+assert.equal((await request('POST','/api/suppliers',{}, {origin:'https://other.example'})).status,403);
+let r=await request('POST','/api/suppliers',{name:'Wholesale',email:'',phone:'',lead_days:3});const supplierId=r.data.id;
+r=await request('POST','/api/products',{name:'Report product',sku:'REPORT-1',barcode:'00001234',category:'Testing',cost:3,price:10,min_stock:2,supplier_id:supplierId});assert.equal(r.status,201);const productId=r.data.id;
+r=await request('POST','/api/orders',{product_id:productId,supplier_id:supplierId,quantity:10,expected_date:'2026-11-01'});assert.equal(r.status,201);const orderId=r.data.id;
+assert.equal((await request('POST','/api/orders/'+orderId+'/receive',{quantity:4})).status,200);
+r=await request('GET','/api/orders');assert.equal(r.data[0].expected_date,'2026-11-01');assert.equal(r.data[0].received_quantity,4);assert.equal(r.data[0].status,'ordered');
+assert.equal((await request('POST','/api/orders/'+orderId+'/receive',{quantity:7})).status,409);
+assert.equal((await request('PUT','/api/orders/'+orderId,{quantity:3})).status,409);
+assert.equal((await request('GET','/api/recommendations')).data[0].onOrder,6);
+assert.equal((await request('POST','/api/orders/'+orderId+'/receive',{quantity:6})).status,200);
+assert.equal((await request('POST','/api/orders/'+orderId+'/receive',{quantity:1})).status,409);
+assert.equal((await request('GET','/api/products')).data[0].stock,10);
+assert.equal((await request('POST','/api/movements',{product_id:productId,kind:'sale',quantity:2})).status,201);
+const today=(await engine.query('SELECT CURRENT_DATE::text date')).rows[0].date;
+const reportUrl='/api/reports/sales?from='+today+'&to='+today;
+r=await request('GET',reportUrl);assert.equal(r.status,200);assert.equal(r.data.totals.revenue,20);assert.equal(r.data.totals.cost,6);assert.equal(r.data.totals.profit,14);
+await request('PUT','/api/products/'+productId,{name:'Report product',sku:'REPORT-1',barcode:'00001234',category:'Testing',cost:8,price:20,min_stock:2,supplier_id:supplierId});
+r=await request('GET',reportUrl);assert.equal(r.data.totals.profit,14);
+assert.equal((await request('GET','/api/reports/sales?from=2026-02-30&to=2026-03-01')).status,400);
+assert.equal((await request('POST','/api/stocktakes',{note:'Count',items:[{product_id:productId,expected_stock:10,counted:7}]})).status,409);
+assert.equal((await request('POST','/api/stocktakes',{note:'Count',items:[{product_id:productId,expected_stock:8,counted:7}]})).status,201);
+assert.equal((await request('GET','/api/products')).data[0].stock,7);
+const imported={name:'Imported',sku:'IMPORT-1',barcode:'00009999',category:'CSV',cost:2,price:5,min_stock:1,supplier_id:null};
+r=await request('POST','/api/products/import',{products:[imported]});assert.equal(r.status,200);assert.equal(r.data.created,1);
+r=await request('POST','/api/products/import',{products:[{...imported,name:'Updated import'}]});assert.equal(r.status,200);assert.equal(r.data.updated,1);
+r=await request('POST','/api/products/import',{products:[{...imported,sku:'ROLLBACK-1',barcode:'rollback'},{...imported,sku:'FAIL-1',barcode:'fail',supplier_id:999999}]});assert.equal(r.status,400);
+assert.equal((await request('GET','/api/products')).data.some(p=>p.sku==='ROLLBACK-1'),false);
+assert.equal((await request('POST','/api/products/import',{products:[imported,imported]})).status,400);
+r=await request('GET','/api/history');assert.equal(r.status,200);assert.ok(r.data.rows.some(row=>row.actor==='Local workspace'));assert.ok(r.data.rows.every(row=>!row.before_data?.password_hash && !row.after_data?.password_hash));
+// Delivery corrections reconcile both outstanding quantities and stock.
+let deliveries=(await request('GET','/api/orders/'+orderId+'/receipts')).data;
+assert.equal((await request('PUT','/api/orders/'+orderId+'/receipts/'+deliveries[0].id,{quantity:3})).status,200);
+assert.equal((await request('GET','/api/recommendations')).data.find(p=>p.id===productId).onOrder,1);
+assert.equal((await request('GET','/api/products')).data.find(p=>p.id===productId).stock,6);
+assert.equal((await request('POST','/api/suppliers',{}, {'content-type':'text/plain'})).status,415);
+assert.equal((await request('GET','/api/backup')).status,404);
+await engine.close();await db.end();
+console.log('PASS: partial deliveries, over-receipt protection, sale cost snapshots, stocktakes, atomic imports, audit actors, direct workspace access');
